@@ -14,6 +14,7 @@
 import os
 import shutil
 from collections import defaultdict
+from contextlib import nullcontext
 from pathlib import Path
 
 import torch
@@ -71,20 +72,14 @@ def save_fsdp_model(fsdp_plugin, accelerator, model, output_dir, model_index=0, 
     from torch.distributed.fsdp.fully_sharded_data_parallel import StateDictType
 
     os.makedirs(output_dir, exist_ok=True)
-    if fsdp_plugin.state_dict_type == StateDictType.FULL_STATE_DICT:
-        # FSDP raises error when single GPU is used with `offload_to_cpu=True` for FULL_STATE_DICT
-        # so, only enable it when num_processes>1
-        is_multi_process = accelerator.num_processes > 1
-        fsdp_plugin.state_dict_config.offload_to_cpu = is_multi_process
-        fsdp_plugin.state_dict_config.rank0_only = is_multi_process
 
-    with FSDP.state_dict_type(
-        model, fsdp_plugin.state_dict_type, fsdp_plugin.state_dict_config, fsdp_plugin.optim_state_dict_config
-    ):
+    with nullcontext():
         state_dict = _get_model_state_dict(model, adapter_only=adapter_only)
         if fsdp_plugin.state_dict_type == StateDictType.FULL_STATE_DICT:
             weights_name = f"{FSDP_MODEL_NAME}.bin" if model_index == 0 else f"{FSDP_MODEL_NAME}_{model_index}.bin"
             output_model_file = os.path.join(output_dir, weights_name)
+            with torch.no_grad():
+                state_dict = {k: v.full_tensor() for k, v in state_dict.items()}
             if accelerator.process_index == 0:
                 logger.info(f"Saving model to {output_model_file}")
                 torch.save(state_dict, output_model_file)
@@ -121,22 +116,9 @@ def load_fsdp_model(fsdp_plugin, accelerator, model, input_dir, model_index=0, a
     from torch.distributed.fsdp.fully_sharded_data_parallel import StateDictType
 
     accelerator.wait_for_everyone()
-    if fsdp_plugin.state_dict_type == StateDictType.FULL_STATE_DICT:
-        # FSDP raises error when single GPU is used with `offload_to_cpu=True` for FULL_STATE_DICT
-        # so, only enable it when num_processes>1
-        is_multi_process = accelerator.num_processes > 1
-        fsdp_plugin.state_dict_config.offload_to_cpu = is_multi_process
-        fsdp_plugin.state_dict_config.rank0_only = is_multi_process
-    with FSDP.state_dict_type(
-        model, fsdp_plugin.state_dict_type, fsdp_plugin.state_dict_config, fsdp_plugin.optim_state_dict_config
-    ):
+    with nullcontext():
         if fsdp_plugin.state_dict_type == StateDictType.FULL_STATE_DICT:
             if type(model) is not FSDP and accelerator.process_index != 0:
-                if not fsdp_plugin.sync_module_states:
-                    raise ValueError(
-                        "Set the `sync_module_states` flag to `True` so that model states are synced across processes when "
-                        "initializing FSDP object"
-                    )
                 return
             weights_name = f"{FSDP_MODEL_NAME}.bin" if model_index == 0 else f"{FSDP_MODEL_NAME}_{model_index}.bin"
             input_model_file = os.path.join(input_dir, weights_name)
@@ -168,7 +150,7 @@ def load_fsdp_model(fsdp_plugin, accelerator, model, input_dir, model_index=0, a
             )
             state_dict = state_dict["model"]
             logger.info(f"Model loaded from {ckpt_dir}")
-        load_result = _set_model_state_dict(model, state_dict, adapter_only=adapter_only)
+        load_result = fsdp2_load_full_state_dict(accelerator, model, state_dict)
     return load_result
 
 
@@ -180,10 +162,8 @@ def save_fsdp_optimizer(fsdp_plugin, accelerator, optimizer, model, output_dir, 
     from torch.distributed.fsdp.fully_sharded_data_parallel import StateDictType
 
     os.makedirs(output_dir, exist_ok=True)
-    with FSDP.state_dict_type(
-        model, fsdp_plugin.state_dict_type, fsdp_plugin.state_dict_config, fsdp_plugin.optim_state_dict_config
-    ):
-        optim_state = FSDP.optim_state_dict(model, optimizer)
+    with nullcontext():
+        optim_state = optimizer.state_dict()
         if fsdp_plugin.state_dict_type == StateDictType.FULL_STATE_DICT:
             if accelerator.process_index == 0:
                 optim_state_name = (
@@ -213,9 +193,7 @@ def load_fsdp_optimizer(fsdp_plugin, accelerator, optimizer, model, input_dir, o
     from torch.distributed.fsdp.fully_sharded_data_parallel import StateDictType
 
     accelerator.wait_for_everyone()
-    with FSDP.state_dict_type(
-        model, fsdp_plugin.state_dict_type, fsdp_plugin.state_dict_config, fsdp_plugin.optim_state_dict_config
-    ):
+    with nullcontext():
         if fsdp_plugin.state_dict_type == StateDictType.FULL_STATE_DICT:
             optim_state = None
             if accelerator.process_index == 0 or not fsdp_plugin.optim_state_dict_config.rank0_only:
@@ -240,8 +218,8 @@ def load_fsdp_optimizer(fsdp_plugin, accelerator, optimizer, model, input_dir, o
             )
             optim_state = optim_state["optimizer"]
             logger.info(f"Optimizer loaded from {ckpt_dir}")
-        flattened_osd = FSDP.optim_state_dict_to_load(model=model, optim=optimizer, optim_state_dict=optim_state)
-        optimizer.load_state_dict(flattened_osd)
+        flattened_osd = {"state": optim_state}
+        optimizer.state_dict = flattened_osd
 
 
 def _distributed_checkpoint_to_merged_weights(checkpoint_dir: str, save_path: str, safe_serialization: bool = True):
@@ -371,3 +349,26 @@ def ensure_weights_retied(param_init_fn, model: torch.nn.Module, device: torch.c
         return module
 
     return param_init_fn_tied_param
+
+
+def fsdp2_load_full_state_dict(accelerator, model: torch.nn.Module, full_sd: dict):
+    import torch.distributed as dist
+    from torch.distributed.tensor import distribute_tensor
+
+    sharded_sd = model.state_dict()
+    if accelerator.is_main_process:
+        for (param_name, full_param), sharded_param in zip(full_sd.items(), sharded_sd.values()):
+            full_param = full_param.detach().cuda()
+            mesh = sharded_param.device_mesh
+            dist.broadcast(full_param, src=0, group=mesh.get_group())
+            sharded_tensor = distribute_tensor(full_param, mesh, sharded_param.placements)
+            sharded_sd[param_name] = sharded_tensor
+    else:
+        for param_name, sharded_param in sharded_sd.items():
+            full_tensor = torch.empty(sharded_param.size(), device="cuda", dtype=sharded_param.dtype)
+            mesh = sharded_param.device_mesh
+            dist.broadcast(full_tensor, src=0, group=mesh.get_group())
+            sharded_tensor = distribute_tensor(full_tensor, mesh, sharded_param.placements)
+            sharded_sd[param_name] = sharded_tensor
+
+    model.load_state_dict(sharded_sd)
