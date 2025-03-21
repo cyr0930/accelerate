@@ -1554,14 +1554,10 @@ class Accelerator:
                 model.tensor_parallel(self.state.torch_tp_plugin.torch_device_mesh["tp"])
             elif self.distributed_type == DistributedType.FSDP:
                 # We need to fix the optimizer *before* sharding the model
-                from torch.distributed.fsdp.fully_sharded_data_parallel import FullyShardedDataParallel as FSDP
-
-                # Check if the model is already a FSDP model due to `Manual Wrapping` and if so,
-                # don't wrap it again
-                # In case the model is already compiled using PyTorch 2.0 and the wrapped model in it
-                # is a FSDP model, don't wrap it again
-                is_type_fsdp = isinstance(model, FSDP) or (
-                    is_compiled_module(model) and isinstance(model._orig_mod, FSDP)
+                from torch.distributed._composable.fsdp import fully_shard, MixedPrecisionPolicy, CPUOffloadPolicy, FSDPModule, OffloadPolicy
+                from torch.distributed.fsdp.api import ShardingStrategy
+                is_type_fsdp = isinstance(model, FSDPModule) or (
+                    is_compiled_module(model) and isinstance(model._orig_mod, FSDPModule)
                 )
 
                 if not is_type_fsdp:
@@ -1579,18 +1575,41 @@ class Accelerator:
                     kwargs = {
                         "sharding_strategy": fsdp_plugin.sharding_strategy,
                         "cpu_offload": fsdp_plugin.cpu_offload,
-                        "auto_wrap_policy": fsdp_plugin.auto_wrap_policy,
                         "mixed_precision": fsdp_plugin.mixed_precision_policy,
-                        "sync_module_states": fsdp_plugin.sync_module_states,
-                        "backward_prefetch": fsdp_plugin.backward_prefetch,
                         "forward_prefetch": fsdp_plugin.forward_prefetch,
-                        "use_orig_params": fsdp_plugin.use_orig_params,
-                        "param_init_fn": fsdp_plugin.param_init_fn,
                         "ignored_modules": fsdp_plugin.ignored_modules,
-                        "limit_all_gathers": fsdp_plugin.limit_all_gathers,
-                        "device_id": self.device,
+                    }                    
+
+                    fsdp2_kwargs = {
+                        "reshard_after_forward": True,
+                        "mesh": None,
+                        "mp_policy": MixedPrecisionPolicy(),
+                        "offload_policy": OffloadPolicy(),
                     }
-                    model = FSDP(model, **kwargs)
+
+                    if kwargs["sharding_strategy"] == ShardingStrategy.FULL_SHARD:
+                        fsdp2_kwargs["reshard_after_forward"]=True
+                    elif kwargs["sharding_strategy"] == ShardingStrategy.SHARD_GRAD_OP:
+                        fsdp2_kwargs["reshard_after_forward"]=False
+                    elif kwargs["sharding_strategy"] == ShardingStrategy.HYBRID_SHARD:
+                        fsdp2_kwargs["reshard_after_forward"]=True
+                    elif kwargs["sharding_strategy"] == ShardingStrategy._HYBRID_SHARD_ZERO2:
+                        fsdp2_kwargs["reshard_after_forward"]=False
+
+                    if kwargs["mixed_precision"] is not None:
+                        fsdp2_kwargs["mp_policy"] = MixedPrecisionPolicy(
+                            param_dtype=kwargs["mixed_precision"].param_dtype,
+                            reduce_dtype=kwargs["mixed_precision"].reduce_dtype,
+                            cast_forward_inputs=kwargs["mixed_precision"].cast_forward_inputs,
+                        )
+
+                    if kwargs["cpu_offload"] is not None and kwargs["cpu_offload"].offload_params:
+                        fsdp2_kwargs["mp_policy"] = CPUOffloadPolicy()
+
+                    for layer in model.model.layers:
+                        fully_shard(layer, **fsdp2_kwargs)
+                    fully_shard(model, **fsdp2_kwargs)
+
                     if fsdp_plugin.activation_checkpointing:
                         from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
                             CheckpointImpl,
@@ -1606,72 +1625,6 @@ class Accelerator:
                             ),
                             auto_wrap_policy=fsdp_plugin.auto_wrap_policy,
                         )
-
-                # In the event the model had been loaded in low precision, but
-                # mixed precision had also been activated, then we follow DeepSpeed's
-                # strategy to hold the parameters in full precision.
-                # - assume that trainer.args.bf16 and trainer.args.fp16 are already checked against
-                #   fsdp_plugin.mixed_precision_policy.
-                # - NOTE: we do not check the mixed_precision attribute on the FSDP root wrapper.
-                #   * this attribute will always set by init_utils.init_core_state so its always not None.
-                #   * mixed_precision.param_dtype only regards _fwd_bwd_param_dtype
-                #   * if model is loaded in 16bit, and even if mixed_precision.param_dtype is None,
-                #     we sill want to upcast the flat_param.
-                if self.mixed_precision != "no":  # if mixed precision is set
-                    upcasted_log = []
-                    for module in FSDP.fsdp_modules(model):
-                        # Referencing DeepSpeed Zero3
-                        # - in Init, params are converted to 16bit while partitioning.
-                        # - in accelerator.prepare, deepspeed.initalize is called to:
-                        #   * creates the DeepSpeeedEngine.
-                        #   * since zero_optimization() is True , calls engine._configure_zero_optimizer.
-                        #
-                        # Inside the DeepSpeed Zero3 optimizer configuration, which initalizes
-                        # DeepSpeedZeroOptimizer_Stage3, during which:
-                        #   * trainable_param_groups are obtained from the attached optimizer
-                        #     (already partitioned in 16bit).
-                        #   * then _setup_for_real_optimizer -> _create_fp32_partitions
-                        #     which performs the fp32 upcasting.
-
-                        # To mimick DeepSeepds's casting in FSDP, we look at the (single) FlatParameter held
-                        # within an FSDP wrapper. This FlatParameter will be seen by the optimizer.
-                        #  - even though there is a torch.device('meta') guard below, we
-                        #    expect _init_utils._init_param_handle_from_module to already
-                        #    sync the parameter.
-
-                        if not module._has_params:
-                            continue  # skip if FSDP module not managing parameters
-                        param = module._flat_param
-                        if (
-                            param.dtype != torch.float32
-                            and param.device != torch.device("meta")
-                            and param.requires_grad
-                        ):
-                            # keep log of names_params that was upcasted
-                            # NOTE: resorted to this because warnings.simplefilter("once") is somehow not working
-                            name_param_log = (module.module.__class__.__name__, ", ".join(module._flat_param._fqns))
-                            if name_param_log not in upcasted_log:
-                                upcasted_log.append(name_param_log)
-
-                            # this works because of FSDP's _runtime_utils.lazy_init.
-                            # Have to be careful not to call anything before this that
-                            # triggers lazy_init (e.g., _is_fsdp_root).
-                            param.data = param.data.to(torch.float32)  # upcasting
-                            module._handle._orig_param_dtype = torch.float32  # update
-
-                    # report the warnings
-                    # some messages can be quite repetitive, especially when reporting about layers that have identical architecture.
-                    if self.is_main_process:
-                        for name_log, param_log in upcasted_log:
-                            warnings.warn(
-                                f"Upcasted low precision parameters in {name_log} because mixed precision turned on in FSDP. "
-                                f"Affects: {param_log}."
-                            )
-
-                        if len(upcasted_log) > 0:
-                            warnings.warn(
-                                "FSDP upcast of low precision parameters may affect the precision of model checkpoints."
-                            )
 
                 # if the previous and current models are same, delete the previous one
                 if len(self._models) > 1 and (self._models[-2] is self._models[-1]):
