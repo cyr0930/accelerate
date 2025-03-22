@@ -1564,14 +1564,6 @@ class Accelerator:
                      self.state.fsdp_plugin.set_auto_wrap_policy(model)
                      fsdp_plugin = self.state.fsdp_plugin
  
-                     # need to ensure that params are re-tied after running
-                     # param_init_fn
-                     fsdp_plugin.param_init_fn = ensure_weights_retied(
-                         fsdp_plugin.param_init_fn,
-                         model,
-                         self.device,
-                     )
- 
                      kwargs = {
                          "sharding_strategy": fsdp_plugin.sharding_strategy,
                          "cpu_offload": fsdp_plugin.cpu_offload,
