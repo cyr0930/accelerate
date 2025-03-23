@@ -1596,7 +1596,7 @@ class Accelerator:
                         )
 
                     if kwargs["cpu_offload"] is not None and kwargs["cpu_offload"].offload_params:
-                        fsdp2_kwargs["mp_policy"] = CPUOffloadPolicy()
+                        fsdp2_kwargs["offload_policy"] = CPUOffloadPolicy()
 
                     for layer in model.model.layers:
                         fully_shard(layer, **fsdp2_kwargs)
