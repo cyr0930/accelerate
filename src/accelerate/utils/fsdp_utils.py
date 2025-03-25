@@ -150,7 +150,8 @@ def load_fsdp_model(fsdp_plugin, accelerator, model, input_dir, model_index=0, a
             )
             state_dict = state_dict["model"]
             logger.info(f"Model loaded from {ckpt_dir}")
-        load_result = fsdp2_load_full_state_dict(accelerator, model, state_dict)
+        from torch.distributed.checkpoint.state_dict import set_model_state_dict
+        load_result = set_model_state_dict(model, state_dict)
     return load_result
 
 
