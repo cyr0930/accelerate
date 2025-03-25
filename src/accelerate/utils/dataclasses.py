@@ -34,7 +34,7 @@ from .constants import (
     BETA_TP_AVAILABLE_PYTORCH_VERSION,
     FSDP_AUTO_WRAP_POLICY,
     FSDP_BACKWARD_PREFETCH,
-    FSDP_SHARDING_STRATEGY,
+    FSDP_RESHARD_AFTER_FORWARD,
     MITA_PROFILING_AVAILABLE_PYTORCH_VERSION,
     XPU_PROFILING_AVAILABLE_PYTORCH_VERSION,
 )
@@ -1451,9 +1451,8 @@ class FullyShardedDataParallelPlugin:
     This plugin is used to enable fully sharded data parallelism.
 
     Args:
-        sharding_strategy (`Union[str, torch.distributed.fsdp.ShardingStrategy]`, defaults to `'FULL_SHARD'`):
-            Sharding strategy to use. Should be either a `str` or an instance of
-            `torch.distributed.fsdp.fully_sharded_data_parallel.ShardingStrategy`.
+        reshard_after_forward (`Union[str, bool]`, defaults to `True`):
+            Sharding strategy to use.
         backward_prefetch (`Union[str, torch.distributed.fsdp.BackwardPrefetch]`, defaults to `'NO_PREFETCH'`):
             Backward prefetch strategy to use. Should be either a `str` or an instance of
             `torch.distributed.fsdp.fully_sharded_data_parallel.BackwardPrefetch`.
@@ -1507,10 +1506,10 @@ class FullyShardedDataParallelPlugin:
             is `size_based_wrap`.
     """
 
-    sharding_strategy: Union[str, "torch.distributed.fsdp.ShardingStrategy"] = field(
+    reshard_after_forward: Union[str, bool] = field(
         default=None,
         metadata={
-            "help": "Sharding strategy to use. Should be either a `str` or an instance of `torch.distributed.fsdp.fully_sharded_data_parallel.ShardingStrategy`. Defaults to 'FULL_SHARD'"
+            "help": "Sharding strategy to use. Defaults to 'True'"
         },
     )
     backward_prefetch: Union[str, "torch.distributed.fsdp.BackwardPrefetch"] = field(
@@ -1641,16 +1640,11 @@ class FullyShardedDataParallelPlugin:
 
         env_prefix = "FSDP_"
         # Strategy: By default we should always assume that values are passed in, else we check the environment variables
-        if self.sharding_strategy is None:
-            self.sharding_strategy = os.environ.get(env_prefix + "SHARDING_STRATEGY", "FULL_SHARD")
-        if isinstance(self.sharding_strategy, str):
-            # We need to remap based on custom enum values for user readability
-            if self.sharding_strategy.upper() in FSDP_SHARDING_STRATEGY:
-                self.sharding_strategy = FSDP_SHARDING_STRATEGY.index(self.sharding_strategy.upper()) + 1
-            if isinstance(self.sharding_strategy, int) or self.sharding_strategy.isdigit():
-                self.sharding_strategy = ShardingStrategy(int(self.sharding_strategy))
-            else:
-                self.sharding_strategy = ShardingStrategy[self.sharding_strategy.upper()]
+        if self.reshard_after_forward is None:
+            reshard_after_forward = os.environ.get(env_prefix + "RESHARD_AFTER_FORWARD", "true")
+            self.reshard_after_forward = str_to_bool(reshard_after_forward.lower()) == 1
+        if isinstance(self.reshard_after_forward, str):
+            self.reshard_after_forward = str_to_bool(self.reshard_after_forward.lower()) == 1
 
         if self.cpu_offload is None:
             self.cpu_offload = str_to_bool(os.environ.get(env_prefix + "OFFLOAD_PARAMS", "False")) == 1
