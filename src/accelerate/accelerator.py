@@ -1565,7 +1565,7 @@ class Accelerator:
                     fsdp_plugin = self.state.fsdp_plugin
 
                     kwargs = {
-                        "sharding_strategy": fsdp_plugin.sharding_strategy,
+                        "reshard_after_forward": fsdp_plugin.reshard_after_forward,
                         "cpu_offload": fsdp_plugin.cpu_offload,
                         "mixed_precision": fsdp_plugin.mixed_precision_policy,
                         "forward_prefetch": fsdp_plugin.forward_prefetch,
@@ -1573,20 +1573,11 @@ class Accelerator:
                     }                    
 
                     fsdp2_kwargs = {
-                        "reshard_after_forward": True,
-                        "mesh": None,
+                        "reshard_after_forward": kwargs["reshard_after_forward"],
+                        "mesh": None,    # TODO: support 2D-mesh
                         "mp_policy": MixedPrecisionPolicy(),
                         "offload_policy": OffloadPolicy(),
                     }
-
-                    if kwargs["sharding_strategy"] == ShardingStrategy.FULL_SHARD:
-                        fsdp2_kwargs["reshard_after_forward"]=True
-                    elif kwargs["sharding_strategy"] == ShardingStrategy.SHARD_GRAD_OP:
-                        fsdp2_kwargs["reshard_after_forward"]=False
-                    elif kwargs["sharding_strategy"] == ShardingStrategy.HYBRID_SHARD:
-                        fsdp2_kwargs["reshard_after_forward"]=True
-                    elif kwargs["sharding_strategy"] == ShardingStrategy._HYBRID_SHARD_ZERO2:
-                        fsdp2_kwargs["reshard_after_forward"]=False
 
                     if kwargs["mixed_precision"] is not None:
                         fsdp2_kwargs["mp_policy"] = MixedPrecisionPolicy(
