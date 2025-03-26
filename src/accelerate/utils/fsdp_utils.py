@@ -373,3 +373,66 @@ def fsdp2_load_full_state_dict(accelerator, model: torch.nn.Module, full_sd: dic
             sharded_sd[param_name] = sharded_tensor
 
     model.load_state_dict(sharded_sd)
+
+
+def fsdp2_prepare_model(accelerator, model: torch.nn.Module) -> torch.nn.Module:
+    from torch.distributed._composable.fsdp import fully_shard, MixedPrecisionPolicy, CPUOffloadPolicy, FSDPModule, OffloadPolicy
+    is_type_fsdp = isinstance(model, FSDPModule) or (
+        is_compiled_module(model) and isinstance(model._orig_mod, FSDPModule)
+    )
+
+    if not is_type_fsdp:
+        fsdp_plugin = accelerator.state.fsdp_plugin
+        fsdp_plugin.set_auto_wrap_policy(model)
+
+        kwargs = {
+            "reshard_after_forward": fsdp_plugin.reshard_after_forward,
+            "cpu_offload": fsdp_plugin.cpu_offload,
+            "mixed_precision": fsdp_plugin.mixed_precision_policy,
+            "forward_prefetch": fsdp_plugin.forward_prefetch,
+            "ignored_modules": fsdp_plugin.ignored_modules,
+        }                    
+
+        fsdp2_kwargs = {
+            "reshard_after_forward": kwargs["reshard_after_forward"],
+            "mesh": None,
+            "mp_policy": MixedPrecisionPolicy(),
+            "offload_policy": OffloadPolicy(),
+        }
+
+        if kwargs["mixed_precision"] is not None:
+            fsdp2_kwargs["mp_policy"] = MixedPrecisionPolicy(
+                param_dtype=kwargs["mixed_precision"].param_dtype,
+                reduce_dtype=kwargs["mixed_precision"].reduce_dtype,
+                cast_forward_inputs=kwargs["mixed_precision"].cast_forward_inputs,
+            )
+
+        if kwargs["cpu_offload"] is not None and kwargs["cpu_offload"].offload_params:
+            fsdp2_kwargs["offload_policy"] = CPUOffloadPolicy()
+
+        fully_shard(model.model.vision_tower.vision_tower.vision_model.embeddings, **fsdp2_kwargs)
+        for module in model.model.vision_tower.vision_tower.vision_model.encoder.layers:
+            fully_shard(module, **fsdp2_kwargs)
+        fully_shard(model.model.mm_projector, **fsdp2_kwargs)
+        # fully_shard(model.model.embed_tokens, **fsdp2_kwargs)
+        for module in model.model.layers:
+            fully_shard(module, **fsdp2_kwargs)
+        fully_shard(model.lm_head, **fsdp2_kwargs)
+        fully_shard(model, **fsdp2_kwargs)
+
+        if fsdp_plugin.activation_checkpointing:
+            from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
+                CheckpointImpl,
+                apply_activation_checkpointing,
+                checkpoint_wrapper,
+            )
+
+            apply_activation_checkpointing(
+                model,
+                checkpoint_wrapper_fn=functools.partial(
+                    checkpoint_wrapper,
+                    checkpoint_impl=CheckpointImpl.NO_REENTRANT,
+                ),
+                auto_wrap_policy=fsdp_plugin.auto_wrap_policy,
+            )
+    return model
