@@ -82,6 +82,7 @@ from .utils import (
     convert_outputs_to_fp32,
     ensure_weights_retied,
     extract_model_from_parallel,
+    fsdp2_prepare_model,
     gather,
     gather_object,
     get_grad_scaler,
@@ -1553,61 +1554,7 @@ class Accelerator:
                     )
                 model.tensor_parallel(self.state.torch_tp_plugin.torch_device_mesh["tp"])
             elif self.distributed_type == DistributedType.FSDP:
-                # We need to fix the optimizer *before* sharding the model
-                from torch.distributed._composable.fsdp import fully_shard, MixedPrecisionPolicy, CPUOffloadPolicy, FSDPModule, OffloadPolicy
-                from torch.distributed.fsdp.api import ShardingStrategy
-                is_type_fsdp = isinstance(model, FSDPModule) or (
-                    is_compiled_module(model) and isinstance(model._orig_mod, FSDPModule)
-                )
-
-                if not is_type_fsdp:
-                    self.state.fsdp_plugin.set_auto_wrap_policy(model)
-                    fsdp_plugin = self.state.fsdp_plugin
-
-                    kwargs = {
-                        "reshard_after_forward": fsdp_plugin.reshard_after_forward,
-                        "cpu_offload": fsdp_plugin.cpu_offload,
-                        "mixed_precision": fsdp_plugin.mixed_precision_policy,
-                        "forward_prefetch": fsdp_plugin.forward_prefetch,
-                        "ignored_modules": fsdp_plugin.ignored_modules,
-                    }                    
-
-                    fsdp2_kwargs = {
-                        "reshard_after_forward": kwargs["reshard_after_forward"],
-                        "mesh": None,    # TODO: support 2D-mesh
-                        "mp_policy": MixedPrecisionPolicy(),
-                        "offload_policy": OffloadPolicy(),
-                    }
-
-                    if kwargs["mixed_precision"] is not None:
-                        fsdp2_kwargs["mp_policy"] = MixedPrecisionPolicy(
-                            param_dtype=kwargs["mixed_precision"].param_dtype,
-                            reduce_dtype=kwargs["mixed_precision"].reduce_dtype,
-                            cast_forward_inputs=kwargs["mixed_precision"].cast_forward_inputs,
-                        )
-
-                    if kwargs["cpu_offload"] is not None and kwargs["cpu_offload"].offload_params:
-                        fsdp2_kwargs["offload_policy"] = CPUOffloadPolicy()
-
-                    for layer in model.model.layers:
-                        fully_shard(layer, **fsdp2_kwargs)
-                    fully_shard(model, **fsdp2_kwargs)
-
-                    if fsdp_plugin.activation_checkpointing:
-                        from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
-                            CheckpointImpl,
-                            apply_activation_checkpointing,
-                            checkpoint_wrapper,
-                        )
-
-                        apply_activation_checkpointing(
-                            model,
-                            checkpoint_wrapper_fn=functools.partial(
-                                checkpoint_wrapper,
-                                checkpoint_impl=CheckpointImpl.NO_REENTRANT,
-                            ),
-                            auto_wrap_policy=fsdp_plugin.auto_wrap_policy,
-                        )
+                model = fsdp2_prepare_model(self, model)
 
                 # if the previous and current models are same, delete the previous one
                 if len(self._models) > 1 and (self._models[-2] is self._models[-1]):
