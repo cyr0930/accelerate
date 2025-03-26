@@ -377,6 +377,7 @@ def fsdp2_load_full_state_dict(accelerator, model: torch.nn.Module, full_sd: dic
 
 def fsdp2_prepare_model(accelerator, model: torch.nn.Module) -> torch.nn.Module:
     from torch.distributed._composable.fsdp import fully_shard, MixedPrecisionPolicy, CPUOffloadPolicy, FSDPModule, OffloadPolicy
+    from .other import is_compiled_module
     is_type_fsdp = isinstance(model, FSDPModule) or (
         is_compiled_module(model) and isinstance(model._orig_mod, FSDPModule)
     )
