@@ -412,14 +412,8 @@ def fsdp2_prepare_model(accelerator, model: torch.nn.Module) -> torch.nn.Module:
         if kwargs["cpu_offload"] is not None and kwargs["cpu_offload"].offload_params:
             fsdp2_kwargs["offload_policy"] = CPUOffloadPolicy()
 
-        fully_shard(model.model.vision_tower.vision_tower.vision_model.embeddings, **fsdp2_kwargs)
-        for module in model.model.vision_tower.vision_tower.vision_model.encoder.layers:
-            fully_shard(module, **fsdp2_kwargs)
-        fully_shard(model.model.mm_projector, **fsdp2_kwargs)
-        # fully_shard(model.model.embed_tokens, **fsdp2_kwargs)
-        for module in model.model.layers:
-            fully_shard(module, **fsdp2_kwargs)
-        fully_shard(model.lm_head, **fsdp2_kwargs)
+        for layer in model.model.layers:
+            fully_shard(layer, **fsdp2_kwargs)
         fully_shard(model, **fsdp2_kwargs)
 
         if fsdp_plugin.activation_checkpointing:
