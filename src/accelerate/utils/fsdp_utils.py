@@ -212,15 +212,15 @@ def load_fsdp_optimizer(fsdp_plugin, accelerator, optimizer, model, input_dir, o
                 else input_dir
             )
             logger.info(f"Loading Optimizer from {ckpt_dir}")
-            optim_state = load_sharded_optimizer_state_dict(
-                model_state_dict=_get_model_state_dict(model, adapter_only=adapter_only),
-                optimizer_key="optimizer",
+            optim_state = {"optimizer": optimizer.state_dict()}
+            dist_cp.load(
+                optim_state,
+                checkpoint_id=ckpt_dir,
                 storage_reader=dist_cp.FileSystemReader(ckpt_dir),
             )
             optim_state = optim_state["optimizer"]
             logger.info(f"Optimizer loaded from {ckpt_dir}")
-        flattened_osd = {"state": optim_state}
-        optimizer.state_dict = flattened_osd
+        optimizer.load_state_dict(optim_state)
 
 
 def _distributed_checkpoint_to_merged_weights(checkpoint_dir: str, save_path: str, safe_serialization: bool = True):
