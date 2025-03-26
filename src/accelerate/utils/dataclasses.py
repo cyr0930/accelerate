@@ -1640,10 +1640,14 @@ class FullyShardedDataParallelPlugin:
         env_prefix = "FSDP_"
         # Strategy: By default we should always assume that values are passed in, else we check the environment variables
         if self.reshard_after_forward is None:
-            reshard_after_forward = os.environ.get(env_prefix + "RESHARD_AFTER_FORWARD", "true")
-            self.reshard_after_forward = str_to_bool(reshard_after_forward.lower()) == 1
+            self.reshard_after_forward = os.environ.get(env_prefix + "RESHARD_AFTER_FORWARD", "true")
         if isinstance(self.reshard_after_forward, str):
-            self.reshard_after_forward = str_to_bool(self.reshard_after_forward.lower()) == 1
+            if self.reshard_after_forward == "true":
+                self.reshard_after_forward = True
+            elif self.reshard_after_forward == "false":
+                self.reshard_after_forward = False
+            else:
+                self.reshard_after_forward = int(self.reshard_after_forward)
 
         if self.cpu_offload is None:
             self.cpu_offload = str_to_bool(os.environ.get(env_prefix + "OFFLOAD_PARAMS", "False")) == 1
