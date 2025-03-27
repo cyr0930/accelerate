@@ -414,6 +414,11 @@ def fsdp2_prepare_model(accelerator, model: torch.nn.Module) -> torch.nn.Module:
 
         for layer in model.model.layers:
             fully_shard(layer, **fsdp2_kwargs)
+        fsdp2_kwargs["mp_policy"] = MixedPrecisionPolicy(
+            param_dtype=kwargs["mixed_precision"].param_dtype,
+            reduce_dtype=kwargs["mixed_precision"].reduce_dtype,
+            cast_forward_inputs=kwargs["mixed_precision"].cast_root_forward_inputs,
+        )
         fully_shard(model, **fsdp2_kwargs)
 
         if fsdp_plugin.activation_checkpointing:
